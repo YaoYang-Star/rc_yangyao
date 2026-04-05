@@ -42,6 +42,8 @@ func main() {
 
 	// 启动投递worker
 	go worker()
+	// 启动重试调度worker
+	go retryWorker()
 
 	log.Println("API通知服务启动，端口:8080")
 	r.Run(":8080")
