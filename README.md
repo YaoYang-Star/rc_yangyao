@@ -14,11 +14,83 @@
 └─────────────┘     └────────────────────┘     └──────────────────┘
 ```
 
+## 新增功能特性
+### v1.1.0 版本更新
+✅ **核心bug修复**：修复投递时body未正确发送的严重问题，错误信息格式化错误问题
+✅ **配置管理**：支持通过环境变量配置所有参数，无需修改代码
+✅ **全链路追踪**：每个任务生成唯一TaskID，支持任务状态跟踪查询
+✅ **安全加固**：
+  - API Key鉴权，防止未授权访问
+  - SSRF防护，禁止内网地址请求，避免安全风险
+✅ **可观测性提升**：
+  - 健康检查接口，支持监控告警
+  - 任务状态查询接口，可实时查看投递进度
+  - 结构化日志，全链路透传TaskID，方便排查问题
+✅ **高可用增强**：
+  - 优雅停机，进程退出时等待任务处理完成，避免消息丢失
+  - 完善的错误处理，所有Redis操作错误都被捕获处理
+✅ **部署友好**：
+  - 提供Dockerfile和docker-compose.yml，一键部署
+  - 支持K8s部署，健康检查接口符合云原生标准
+
 ### 核心模块
 1. **HTTP接入层**：提供统一的API接口给业务系统调用，接收通知请求，做参数校验后写入消息队列
 2. **消息队列**：异步解耦，缓冲流量峰值，保证请求不丢失
 3. **任务调度层**：负责任务的重试调度、失败处理、延迟执行
 4. **投递执行层**：实际执行HTTP请求投递，处理不同的Header/Body格式，记录投递结果
+
+## 快速开始
+
+### 本地运行
+```bash
+# 安装依赖
+go mod download
+
+# 启动Redis
+redis-server
+
+# 启动服务
+go run main.go
+
+# 提交通知请求
+curl -X POST http://localhost:8080/notify \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-api-key" \
+  -d '{
+    "url": "https://example.com/webhook",
+    "method": "POST",
+    "headers": {
+      "X-Custom-Header": "test"
+    },
+    "body": {
+      "event": "user_register",
+      "user_id": 12345
+    }
+  }'
+
+# 查询任务状态
+curl http://localhost:8080/task/{task_id}
+```
+
+### Docker部署
+```bash
+# 一键启动
+docker-compose up -d
+
+# 停止服务
+docker-compose down
+```
+
+## 环境变量配置
+| 变量名 | 说明 | 默认值 |
+|--------|------|--------|
+| REDIS_ADDR | Redis地址 | localhost:6379 |
+| REDIS_PASSWORD | Redis密码 | 空 |
+| REDIS_DB | Redis数据库 | 0 |
+| HTTP_PORT | HTTP服务端口 | :8080 |
+| MAX_RETRY | 最大重试次数 | 24 |
+| REQUEST_TIMEOUT | HTTP请求超时时间（秒） | 10 |
+| API_KEY | 接口鉴权Key | 空（不开启鉴权） |
 
 ## 关键工程决策
 
