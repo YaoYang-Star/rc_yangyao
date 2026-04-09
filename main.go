@@ -37,12 +37,19 @@ type Config struct {
 
 // NotificationRequest 业务系统提交的通知请求
 type NotificationRequest struct {
-	TaskID  string            `json:"task_id"` // 全局唯一任务ID
-	URL     string            `json:"url" binding:"required"`
-	Method  string            `json:"method" default:"POST"`
-	Headers map[string]string `json:"headers"`
-	Body    interface{}       `json:"body" binding:"required"`
-	Retry   int               `json:"retry" default:"0"` // 当前重试次数
+	TaskID       string            `json:"task_id"` // 全局唯一任务ID
+	IdempotentID string            `json:"idempotent_id"` // 幂等ID，业务方传入，避免重复投递
+	URL          string            `json:"url" binding:"required"`
+	Method       string            `json:"method" default:"POST"`
+	Headers      map[string]string `json:"headers"`
+	Body         interface{}       `json:"body" binding:"required"`
+	CallbackURL  string            `json:"callback_url"` // 投递结果回调地址
+	Retry        int               `json:"retry" default:"0"` // 当前重试次数
+}
+
+// BatchNotificationRequest 批量通知请求
+type BatchNotificationRequest struct {
+	Notifications []NotificationRequest `json:"notifications" binding:"required,min=1,max=100"`
 }
 
 // 全局配置
@@ -78,13 +85,24 @@ func main() {
 
 	// 业务系统提交通知的接口
 	r.POST("/notify", submitNotificationHandler)
+	// 批量提交通知接口
+	r.POST("/notify/batch", submitBatchNotificationHandler)
 	// 任务状态查询接口
 	r.GET("/task/:task_id", getTaskStatusHandler)
+	// 死信队列管理接口
+	group := r.Group("/dlq")
+	{
+		group.GET("/list", listDeadLetterHandler)
+		group.POST("/retry/:task_id", retryDeadLetterHandler)
+		group.POST("/retry/all", retryAllDeadLetterHandler)
+		group.DELETE("//:task_id", deleteDeadLetterHandler)
+	}
 
 	// 启动worker
 	ctx, cancel := context.WithCancel(context.Background())
 	go worker(ctx)
 	go retryWorker(ctx)
+	go callbackWorker(ctx) // 启动回调worker
 
 	// 优雅停机处理
 	sigChan := make(chan os.Signal, 1)
@@ -159,6 +177,21 @@ func submitNotificationHandler(c *gin.Context) {
 		return
 	}
 
+	// 幂等校验
+	if req.IdempotentID != "" {
+		exists, err := rdb.Exists(ctx, "idempotent:"+req.IdempotentID).Result()
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "幂等校验失败"})
+			return
+		}
+		if exists == 1 {
+			// 已经处理过，直接返回已存在的TaskID
+			taskID, _ := rdb.Get(ctx, "idempotent:"+req.IdempotentID).Result()
+			c.JSON(http.StatusOK, gin.H{"status": "success", "task_id": taskID, "message": "通知已提交（幂等命中）"})
+			return
+		}
+	}
+
 	// 校验URL，防止SSRF攻击
 	if err := validateURL(req.URL); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -169,6 +202,11 @@ func submitNotificationHandler(c *gin.Context) {
 	req.TaskID = uuid.NewString()
 	if req.Method == "" {
 		req.Method = "POST"
+	}
+
+	// 保存幂等关系
+	if req.IdempotentID != "" {
+		rdb.SetEX(ctx, "idempotent:"+req.IdempotentID, req.TaskID, 7*24*time.Hour)
 	}
 
 	// 保存任务元信息
@@ -216,6 +254,243 @@ func getTaskStatusHandler(c *gin.Context) {
 	var taskMeta map[string]interface{}
 	json.Unmarshal([]byte(taskMetaStr), &taskMeta)
 	c.JSON(http.StatusOK, gin.H{"task_id": taskID, "meta": taskMeta})
+}
+
+// submitBatchNotificationHandler 批量提交通知请求
+func submitBatchNotificationHandler(c *gin.Context) {
+	var req BatchNotificationRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	taskIDs := make([]string, 0, len(req.Notifications))
+	pipe := rdb.Pipeline()
+
+	for _, notify := range req.Notifications {
+		// 幂等校验
+		if notify.IdempotentID != "" {
+			exists, err := rdb.Exists(ctx, "idempotent:"+notify.IdempotentID).Result()
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "幂等校验失败"})
+				return
+			}
+			if exists == 1 {
+				// 已经处理过，直接返回已存在的TaskID
+				taskID, _ := rdb.Get(ctx, "idempotent:"+notify.IdempotentID).Result()
+				taskIDs = append(taskIDs, taskID)
+				continue
+			}
+		}
+
+		// 校验URL
+		if err := validateURL(notify.URL); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "URL校验失败: " + err.Error()})
+			return
+		}
+
+		// 生成TaskID
+		notify.TaskID = uuid.NewString()
+		if notify.Method == "" {
+			notify.Method = "POST"
+		}
+
+		// 保存幂等关系
+		if notify.IdempotentID != "" {
+			pipe.SetEX(ctx, "idempotent:"+notify.IdempotentID, notify.TaskID, 7*24*time.Hour)
+		}
+
+		// 保存任务元信息
+		taskMeta := map[string]interface{}{
+			"url":     notify.URL,
+			"method":  notify.Method,
+			"status":  "pending",
+			"created": time.Now().Unix(),
+		}
+		taskMetaBytes, _ := json.Marshal(taskMeta)
+		pipe.SetEX(ctx, "task:"+notify.TaskID, taskMetaBytes, 7*24*time.Hour)
+
+		// 写入队列
+		taskBytes, err := json.Marshal(notify)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "任务序列化失败"})
+			return
+		}
+		pipe.LPush(ctx, "notification_queue", taskBytes)
+
+		taskIDs = append(taskIDs, notify.TaskID)
+	}
+
+	// 批量执行Redis操作
+	_, err := pipe.Exec(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "批量提交失败"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "success", "task_ids": taskIDs, "count": len(taskIDs), "message": "批量通知已提交"})
+}
+
+// listDeadLetterHandler 查询死信队列列表
+func listDeadLetterHandler(c *gin.Context) {
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "10"))
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 100 {
+		pageSize = 10
+	}
+
+	start := int64((page - 1) * pageSize)
+	end := int64(page*pageSize - 1)
+
+	tasks, err := rdb.LRange(ctx, "dead_letter_queue", start, end).Result()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询死信队列失败"})
+		return
+	}
+
+	total, err := rdb.LLen(ctx, "dead_letter_queue").Result()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取总数失败"})
+		return
+	}
+
+	result := make([]map[string]interface{}, 0, len(tasks))
+	for _, taskStr := range tasks {
+		var task NotificationRequest
+		json.Unmarshal([]byte(taskStr), &task)
+		result = append(result, map[string]interface{}{
+			"task_id": task.TaskID,
+			"url":     task.URL,
+			"retry":   task.Retry,
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"list":  result,
+		"total": total,
+		"page":  page,
+		"size":  pageSize,
+	})
+}
+
+// retryDeadLetterHandler 重试单个死信任务
+func retryDeadLetterHandler(c *gin.Context) {
+	taskID := c.Param("task_id")
+	if taskID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "task_id不能为空"})
+		return
+	}
+
+	// 遍历死信队列找到对应任务
+	tasks, err := rdb.LRange(ctx, "dead_letter_queue", 0, -1).Result()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询死信队列失败"})
+		return
+	}
+
+	for _, taskStr := range tasks {
+		var task NotificationRequest
+		json.Unmarshal([]byte(taskStr), &task)
+		if task.TaskID == taskID {
+			// 从死信队列移除
+			rdb.LRem(ctx, "dead_letter_queue", 0, taskStr)
+			// 重置重试次数
+			task.Retry = 0
+			// 写入主队列
+			taskBytes, _ := json.Marshal(task)
+			rdb.LPush(ctx, "notification_queue", taskBytes)
+			// 更新任务状态
+			taskMeta := map[string]interface{}{
+				"url":    task.URL,
+				"method": task.Method,
+				"status": "retrying",
+				"retry":  0,
+			}
+			taskMetaBytes, _ := json.Marshal(taskMeta)
+			rdb.SetEX(ctx, "task:"+task.TaskID, taskMetaBytes, 7*24*time.Hour)
+
+			c.JSON(http.StatusOK, gin.H{"status": "success", "message": "任务已加入重试队列"})
+			return
+		}
+	}
+
+	c.JSON(http.StatusNotFound, gin.H{"error": "任务不存在"})
+}
+
+// retryAllDeadLetterHandler 重试所有死信任务
+func retryAllDeadLetterHandler(c *gin.Context) {
+	count, err := rdb.LLen(ctx, "dead_letter_queue").Result()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询死信队列失败"})
+		return
+	}
+
+	for i := 0; i < int(count); i++ {
+		taskStr, err := rdb.RPop(ctx, "dead_letter_queue").Result()
+		if err != nil {
+			break
+		}
+		var task NotificationRequest
+		json.Unmarshal([]byte(taskStr), &task)
+		// 重置重试次数
+		task.Retry = 0
+		// 写入主队列
+		taskBytes, _ := json.Marshal(task)
+		rdb.LPush(ctx, "notification_queue", taskBytes)
+		// 更新任务状态
+		taskMeta := map[string]interface{}{
+			"url":    task.URL,
+			"method": task.Method,
+			"status": "retrying",
+			"retry":  0,
+		}
+		taskMetaBytes, _ := json.Marshal(taskMeta)
+		rdb.SetEX(ctx, "task:"+task.TaskID, taskMetaBytes, 7*24*time.Hour)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "success", "count": count, "message": "所有死信任务已加入重试队列"})
+}
+
+// deleteDeadLetterHandler 删除死信任务
+func deleteDeadLetterHandler(c *gin.Context) {
+	taskID := c.Param("task_id")
+	if taskID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "task_id不能为空"})
+		return
+	}
+
+	// 遍历死信队列找到对应任务
+	tasks, err := rdb.LRange(ctx, "dead_letter_queue", 0, -1).Result()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询死信队列失败"})
+		return
+	}
+
+	for _, taskStr := range tasks {
+		var task NotificationRequest
+		json.Unmarshal([]byte(taskStr), &task)
+		if task.TaskID == taskID {
+			// 从死信队列移除
+			rdb.LRem(ctx, "dead_letter_queue", 0, taskStr)
+			// 更新任务状态为已丢弃
+			taskMeta := map[string]interface{}{
+				"url":    task.URL,
+				"method": task.Method,
+				"status": "discarded",
+				"retry":  task.Retry,
+			}
+			taskMetaBytes, _ := json.Marshal(taskMeta)
+			rdb.SetEX(ctx, "task:"+task.TaskID, taskMetaBytes, 7*24*time.Hour)
+
+			c.JSON(http.StatusOK, gin.H{"status": "success", "message": "任务已删除"})
+			return
+		}
+	}
+
+	c.JSON(http.StatusNotFound, gin.H{"error": "任务不存在"})
 }
 
 // validateURL 校验URL安全，防止SSRF攻击
@@ -297,6 +572,17 @@ func worker(ctx context.Context) {
 			rdb.SetEX(ctx, "task:"+task.TaskID, taskMetaBytes, 7*24*time.Hour)
 
 			log.Printf("[任务 %s] 投递成功: %s", task.TaskID, task.URL)
+
+			// 投递成功回调
+			if task.CallbackURL != "" {
+				callbackTask := map[string]interface{}{
+					"task_id": task.TaskID,
+					"status":  "success",
+					"url":     task.URL,
+				}
+				callbackBytes, _ := json.Marshal(callbackTask)
+				rdb.LPush(ctx, "callback_queue", callbackBytes)
+			}
 		}
 	}
 }
@@ -357,6 +643,18 @@ func handleFailedTask(task NotificationRequest) {
 		taskMetaBytes, _ := json.Marshal(taskMeta)
 		rdb.SetEX(ctx, "task:"+task.TaskID, taskMetaBytes, 7*24*time.Hour)
 		log.Printf("[任务 %s] 进入死信队列: %s", task.TaskID, task.URL)
+
+		// 投递失败回调
+		if task.CallbackURL != "" {
+			callbackTask := map[string]interface{}{
+				"task_id": task.TaskID,
+				"status":  "failed",
+				"url":     task.URL,
+				"error":   "超过最大重试次数",
+			}
+			callbackBytes, _ := json.Marshal(callbackTask)
+			rdb.LPush(ctx, "callback_queue", callbackBytes)
+		}
 		return
 	}
 
@@ -433,6 +731,65 @@ func retryWorker(ctx context.Context) {
 			}
 
 			time.Sleep(time.Second)
+		}
+	}
+}
+
+// callbackWorker 回调任务执行器
+func callbackWorker(ctx context.Context) {
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("callbackWorker收到停止信号，退出")
+			return
+		default:
+			result, err := rdb.BRPop(ctx, 1*time.Second, "callback_queue").Result()
+			if err != nil {
+				if err != redis.Nil {
+					log.Printf("获取回调任务失败: %v", err)
+				}
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+
+			var callbackTask map[string]interface{}
+			err = json.Unmarshal([]byte(result[1]), &callbackTask)
+			if err != nil {
+				log.Printf("回调任务解析失败: %v", err)
+				continue
+			}
+
+			callbackURL := callbackTask["url"].(string)
+			callbackBytes, _ := json.Marshal(callbackTask)
+			req, err := http.NewRequest("POST", callbackURL, bytes.NewBuffer(callbackBytes))
+			if err != nil {
+				log.Printf("回调请求创建失败: %v", err)
+				continue
+			}
+			req.Header.Set("Content-Type", "application/json")
+
+			// 回调失败只重试3次
+			success := false
+			for i := 0; i < 3; i++ {
+				resp, err := client.Do(req)
+				if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+					resp.Body.Close()
+					log.Printf("回调成功: %s", callbackURL)
+					success = true
+					break
+				}
+				if resp != nil {
+					resp.Body.Close()
+				}
+				time.Sleep(time.Second * time.Duration(1<<i))
+			}
+			if !success {
+				log.Printf("回调失败超过3次，放弃: %s", callbackURL)
+			}
 		}
 	}
 }
